@@ -15,7 +15,33 @@
 # limitations under the License.
 
 log() {
-  echo "$@"
+  msg="$@"
+  echo "$msg"
+
+  # For Autopilot, if nothing else works, log messages on the API requests to
+  # API server for observability
+
+  # local host=${KUBERNETES_SERVICE_HOST}
+  # local node_url="https://${host}:${KUBERNETES_SERVICE_PORT}/api/v1/nodes/${CURRENT_NODE_NAME:-${HOSTNAME}}"
+
+  # local token=$(</var/run/secrets/kubernetes.io/serviceaccount/token)
+  # cacert="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+  # # Generate a unique key for the log message.
+  # local log_key=$RANDOM
+
+  # local patch_exit_status=0
+  # curl -H "Authorization: Bearer ${token}" --cacert "${cacert}" "${node_url}" 2>&1 \
+  #   -X PATCH \
+  #   -H "Content-Type: application/json-patch+json" \
+  #   -d '[
+  #         {
+  #           "op": "add",
+  #           "path": "/metadata/labels/log-'"${log_key}"'",
+  #           "value": "'"${msg}"'"
+  #         }
+  #       ]' || patch_exit_status=$?
+  # [[ "${patch_exit_status}" -eq 0 ]] && return
 }
 
 fatal() {
@@ -128,11 +154,146 @@ fetch_node_object() {
     # curl may eventually hit an error (e.g. timeout) so redirect its
     # stderr to stdout to make it less visible in logs, but keep it
     # in logs in case it runs into unexpected errors.
-    node_object=$(grep --line-buffered -m1 . <(curl -fsSN -m "${timeout}" -H "Authorization: Bearer ${token}" --cacert "${cacert}" "${node_url}" 2>&${stdout_dup} | jq --unbuffered -c '.object | select(.spec.podCIDR != null)')) || node_object=
+
+    # Hack: Check for the first node object which has the .spec.providerID field set.
+    node_object=$(grep --line-buffered -m1 . <(curl -fsSN -m "${timeout}" -H "Authorization: Bearer ${token}" --cacert "${cacert}" "${node_url}" 2>&${stdout_dup} | jq --unbuffered -c '.object | select(.spec.providerID != null)')) || node_object=
     [[ -n "${node_object}" ]] && return
   done
 
   fatal "Could not successfully watch node and wait for podCIDR."
+}
+
+patch_node_pod_cidrs() {
+  local attempts=$1
+  local timeout=$2
+  local node=$3
+  local node_ipv6_addr=$4
+  local node_ipv4_alias=$5
+
+  # If .spec.podCIDR is already present in the Node, don't do anything
+  local nodeSpecPodCIDR
+  nodeSpecPodCIDR=$(jq -r '.spec.podCIDR' <<<"$node")
+  if [[ "${nodeSpecPodCIDR}" != "null" && -n "${nodeSpecPodCIDR}" ]]; then
+    log "patch_node_pod_cidrs: Node already has a podCIDR set to '${nodeSpecPodCIDR}'; not patching Node"
+    return
+  fi
+
+  local host=${KUBERNETES_SERVICE_HOST}
+  # If host contains a colon (:), it is an IPv6 address, hence needs wrapping
+  # with [..].
+  if [[ "${host}" =~ : ]]; then
+    host="[${host}]"
+  fi
+
+  local token
+  local node_url="https://${host}:${KUBERNETES_SERVICE_PORT}/api/v1/nodes/${CURRENT_NODE_NAME:-${HOSTNAME}}"
+
+  for ((i=1; i<=attempts; i++)); do
+    log "patch_node_pod_cidrs: attempt #${i} at ${node_url}"
+    token=$(</var/run/secrets/kubernetes.io/serviceaccount/token)
+    cacert="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+    local patch_exit_status=0
+    curl -fsSN -m "${timeout}" -H "Authorization: Bearer ${token}" --cacert "${cacert}" "${node_url}" 2>&${stdout_dup} \
+      -X PATCH \
+      -H "Content-Type: application/strategic-merge-patch+json" \
+      -d '{
+            "spec": {
+              "podCIDR": "'"${node_ipv4_alias}"'",
+              "podCIDRs": [
+                "'"${node_ipv4_alias}"'",
+                "'"${node_ipv6_addr}/112"'"
+              ]
+            }
+          }' || patch_exit_status=$?
+    [[ "${patch_exit_status}" -eq 0 ]] && return
+  done
+
+  fatal "patch_node_pod_cidrs: Could not successfully patch node podCIDRs."
+}
+
+# Removes taint "node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule"
+patch_node_taints() {
+  local attempts=$1
+  local timeout=$2
+
+  local host=${KUBERNETES_SERVICE_HOST}
+  # If host contains a colon (:), it is an IPv6 address, hence needs wrapping
+  # with [..].
+  if [[ "${host}" =~ : ]]; then
+    host="[${host}]"
+  fi
+
+  local token
+  local node_url="https://${host}:${KUBERNETES_SERVICE_PORT}/api/v1/nodes/${CURRENT_NODE_NAME:-${HOSTNAME}}"
+
+
+  for ((i=1; i<=attempts; i++)); do
+    token=$(</var/run/secrets/kubernetes.io/serviceaccount/token)
+    cacert="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+    log "patch_node_taints: Fetch node attempt #${i} at ${node_url}"
+    local node_taints
+    node_taints=$(curl -fsSN -m "${timeout}" -H "Authorization: Bearer ${token}" --cacert "${cacert}" "${node_url}" 2>&${stdout_dup} | jq -r '.spec.taints | map(select(.key != "node.cloudprovider.kubernetes.io/uninitialized"))') || node_taints=
+
+    log "patch_node_taints: Patch node attempt with taints #${i} at ${node_url}"
+    local patch_exit_status=0
+    curl -fsSN -m "${timeout}" -H "Authorization: Bearer ${token}" --cacert "${cacert}" "${node_url}" 2>&${stdout_dup} \
+      -X PATCH \
+      -H "Content-Type: application/strategic-merge-patch+json" \
+      -d '{
+            "spec": {
+              "taints": '"${node_taints}"'
+            }
+          }' || patch_exit_status=$?
+    [[ "${patch_exit_status}" -eq 0 ]] && return
+  done
+
+  fatal "patch_node_taints: Could not successfully patch node taints."
+}
+
+patch_node_addresses() {
+  local attempts=$1
+  local timeout=$2
+  local node_internal_ip=${node_internal_ip}
+  local node_external_ip=${node_external_ip}
+  local node_ipv6_addr=${node_ipv6_addr}
+
+  local host=${KUBERNETES_SERVICE_HOST}
+  # If host contains a colon (:), it is an IPv6 address, hence needs wrapping
+  # with [..].
+  if [[ "${host}" =~ : ]]; then
+    host="[${host}]"
+  fi
+
+  local token
+  local node_url="https://${host}:${KUBERNETES_SERVICE_PORT}/api/v1/nodes/${CURRENT_NODE_NAME:-${HOSTNAME}}/status"
+
+  for ((i=1; i<=attempts; i++)); do
+    log "patch_node_addresses: Patching attempt #${i} at ${node_url}"
+    token=$(</var/run/secrets/kubernetes.io/serviceaccount/token)
+    cacert="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+    local patch_exit_status=0
+    curl -fsSN -m "${timeout}" -H "Authorization: Bearer ${token}" --cacert "${cacert}" "${node_url}" 2>&${stdout_dup} \
+      -X PATCH \
+      -H "Content-Type: application/json-patch+json" \
+      -d '[
+            { 
+              "op": "replace", 
+              "path": "/status/addresses", 
+              "value": [
+                { "address": "'"${node_internal_ip}"'", "type": "InternalIP" },
+                { "address": "'"${node_ipv6_addr}"'", "type": "InternalIP" },
+                { "address": "'"${node_external_ip}"'", "type": "ExternalIP" },
+                { "address": "'"${HOSTNAME}"'", "type": "Hostname" }
+              ]
+            }
+          ]' || patch_exit_status=$?
+    [[ "${patch_exit_status}" -eq 0 ]] && return
+  done
+
+  fatal "patch_node_addresses: Could not successfully patch node status with addresses."
 }
 
 # Watch for up to 1 minute, we don't expect podCIDR to be not populated for too
@@ -277,9 +438,9 @@ function fillSubnetsInCniSpecV2Template {
 function fillSubnetsInCniSpecLegacyTemplate {
   local node=$1
   local node_ipv6_addr=$2
+  local node_ipv4_alias=$3
 
-  local primary_subnet
-  primary_subnet=$(jq -r '.spec.podCIDR' <<<"$node")
+  local primary_subnet=$node_ipv4_alias
 
   if is_ipv4_range "${primary_subnet:-}" ; then
     log "PodCIDR IPv4 detected: '${primary_subnet:-}'"
@@ -287,7 +448,7 @@ function fillSubnetsInCniSpecLegacyTemplate {
   elif is_ipv6_range "${primary_subnet:-}" ; then
     fatal "Primary IPv6 pod range detected '${primary_subnet:-}'. It will only work with new spec template."
   else
-    fatal "Failed to fetch PodCIDR from K8s API server, primary_subnet=${primary_subnet:-}."
+    fatal "Failed to fetch PodCIDR from Metadata server, primary_subnet=${primary_subnet:-}."
   fi
 
   if [ -n "${node_ipv6_addr:-}" ] && [ "${node_ipv6_addr}" != "null" ]; then
@@ -308,10 +469,10 @@ function fillSubnetsInCniSpecLegacyTemplate {
 function fillSubnetsInCniSpec {
   case "${CNI_SPEC_TEMPLATE_VERSION:-}" in
     2*)
-      fillSubnetsInCniSpecV2Template "$1" "$2"
+      fillSubnetsInCniSpecV2Template "$1" "$2" "$3"
       ;;
     *)
-      fillSubnetsInCniSpecLegacyTemplate "$1" "$2"
+      fillSubnetsInCniSpecLegacyTemplate "$1" "$2" "$3"
   esac
 }
 
@@ -324,7 +485,21 @@ if [ "$ENABLE_IPV6" == "true" ] || [ "${CLUSTER_STACK_TYPE:-}" == "IPV4_IPV6" ];
   node_ipv6_addr=$(curl -s -k --fail "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/?recursive=true" -H "Metadata-Flavor: Google" | jq -r '.ipv6s[0]' ) ||:
 fi
 
-fillSubnetsInCniSpec "${node_object}" "${node_ipv6_addr}"
+log "node_ipv6_addr = '${node_ipv6_addr}'"
+
+node_ipv4_alias=$(curl -s -k --fail "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip-aliases/0" -H "Metadata-Flavor: Google") ||:
+log "node_ipv4_alias = '${node_ipv4_alias}'"
+
+node_internal_ip=$(curl -s -k --fail "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip" -H "Metadata-Flavor: Google")
+log "node_internal_ip = '${node_internal_ip}'"
+
+node_external_ip=$(curl -s -k --fail "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" -H "Metadata-Flavor: Google")
+log "node_external_ip = '${node_external_ip}'"
+
+fillSubnetsInCniSpec "${node_object}" "${node_ipv6_addr}" "${node_ipv4_alias}"
+
+patch_node_pod_cidrs 3 20 "${node_object}" "${node_ipv6_addr}" "${node_ipv4_alias}"
+patch_node_addresses 3 20 "${node_internal_ip}" "${node_external_ip}" "${node_ipv6_addr}"
 
 if [ "$POPULATE_IP6TABLES" == "true" ] ; then
   # Ensure the IPv6 firewall rules are as expected.
@@ -481,6 +656,7 @@ file_written=false
 if [[ -n "${CILIUM_FAST_START_NAMESPACES:-}" ]]; then
   log "Cilium has fast-start; writing CNI config upfront then wait for ${cilium_watchdog_fast_start_wait}s and start to check Cilium health."
   write_file "${output_file}" "${cni_spec}"
+  patch_node_taints 3 20
   file_written=true
   sleep "${cilium_watchdog_fast_start_wait}"s
 fi
@@ -491,6 +667,7 @@ while true; do
     log "Cilium healthz reported success; writing CNI config if never written (written: ${file_written}) or not already there then wait for ${cilium_watchdog_success_wait}s."
     if [[ "${file_written}" != "true" ]] || [[ ! -f "${output_file}" ]]; then
       write_file "${output_file}" "${cni_spec}"
+      patch_node_taints 3 20
       file_written=true
     fi
     sleep "${cilium_watchdog_success_wait}"s
